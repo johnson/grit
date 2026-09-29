@@ -30,7 +30,7 @@
 //! reusing the shared v2 request framing and side-band demuxer from
 //! [`crate::fetch`].
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::io::{Cursor, Read, Write};
 use std::path::Path;
 
@@ -118,6 +118,32 @@ pub trait HttpClient: Send + Sync {
     fn smart_http_enabled(&self) -> bool {
         true
     }
+
+    /// Issue the same `POST` as [`post`](Self::post) but hand the body back as
+    /// an [`HttpBody`] that yields it in pieces.
+    ///
+    /// The default buffers the whole response and yields it as a single chunk, so
+    /// every existing client keeps working unchanged and pays exactly what it
+    /// paid before. A client that can deliver a response incrementally -- a
+    /// mobile `URLSession` delegate, for instance -- overrides this and stops
+    /// needing the whole packfile in memory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on a transport failure or a non-success HTTP status.
+    fn post_streaming(
+        &self,
+        url: &str,
+        content_type: &str,
+        accept: &str,
+        body: &[u8],
+        git_protocol: Option<&str>,
+    ) -> Result<Box<dyn HttpBody>> {
+        let bytes = self.post(url, content_type, accept, body, git_protocol)?;
+        Ok(Box::new(OneChunk {
+            bytes: Some(bytes),
+        }))
+    }
 }
 
 /// Forward [`HttpClient`] through a shared [`std::sync::Arc`], so one client can
@@ -152,6 +178,83 @@ impl<C: HttpClient> HttpClient for std::sync::Arc<C> {
 
     fn smart_http_enabled(&self) -> bool {
         (**self).smart_http_enabled()
+    }
+}
+
+/// A response body delivered in pieces rather than as one contiguous buffer.
+///
+/// `HttpClient::post` hands grit the whole `git-upload-pack` response at once, and the
+/// packfile inside that response is the bulk of a fetch. A repository with a
+/// few gigabytes of history therefore had to be resident in memory in full
+/// before a single object was written -- once as the HTTP response, and again
+/// as the de-framed pack. That is survivable on a desktop and fatal in a phone
+/// process, which jetsam kills at a few hundred megabytes with no error at all.
+///
+/// This trait carries the same bytes split into pieces, so the parsing above it
+/// can be written once against a pull-based source and driven by either.
+pub trait HttpBody: Send {
+    /// The next piece of the body, or `None` once it has ended.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the body cannot be read further.
+    fn next_chunk(&mut self) -> Result<Option<Vec<u8>>>;
+}
+
+/// The default `HttpClient::post_streaming` body: the whole response as one chunk.
+struct OneChunk {
+    bytes: Option<Vec<u8>>,
+}
+
+impl HttpBody for OneChunk {
+    fn next_chunk(&mut self) -> Result<Option<Vec<u8>>> {
+        Ok(self.bytes.take())
+    }
+}
+
+/// A pull-based `Read` over an `HttpBody`.
+///
+/// Everything downstream of the HTTP layer -- the pkt-line parser, the side-band
+/// demuxer, `crate::unpack_objects` -- already works from a `Read`, so this is the
+/// seam that lets a streamed body and a buffered one share all of it. With it,
+/// `unpack_objects` can consume a pack of any size without that pack ever being
+/// whole in memory.
+/// The packfile a fetch is still delivering, or None when the remote sent
+/// no pack at all.
+///
+/// Named so the fetch signatures need not spell out the lifetime that ties
+/// the reader to the progress sink it reports side-band text into.
+pub type PackStream = Option<SidebandPackReader>;
+pub struct BodyReader {
+    body: Box<dyn HttpBody>,
+    current: VecDeque<u8>,
+}
+
+impl BodyReader {
+    /// Wrap a body so it can be read as a `Read`.
+    pub fn new(body: Box<dyn HttpBody>) -> Self {
+        Self {
+            body,
+            current: VecDeque::new(),
+        }
+    }
+}
+
+impl std::io::Read for BodyReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        while self.current.is_empty() {
+            match self.body.next_chunk() {
+                Ok(Some(chunk)) if !chunk.is_empty() => self.current.extend(chunk),
+                Ok(Some(_)) => continue,
+                Ok(None) => return Ok(0),
+                Err(e) => return Err(std::io::Error::other(e.to_string())),
+            }
+        }
+        let n = self.current.len().min(buf.len());
+        for (slot, byte) in buf.iter_mut().take(n).zip(self.current.drain(..n)) {
+            *slot = byte;
+        }
+        Ok(n)
     }
 }
 
@@ -640,70 +743,265 @@ struct RoundResult {
 /// Demultiplex the side-band pack from a stateless-RPC response, appending pack
 /// bytes to `out` and forwarding channel-2 progress. Mirrors the CLI's
 /// `read_sideband_pack_until_done`.
-fn read_sideband_pack(
-    r: &mut impl Read,
-    out: &mut Vec<u8>,
-    progress: &mut dyn Progress,
-) -> Result<()> {
-    let mut seen_pack = false;
-    let mut pending: Vec<u8> = Vec::new();
-    loop {
-        let mut len_buf = [0u8; 4];
-        match r.read_exact(&mut len_buf) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err(e.into()),
-        }
-        let len_str = std::str::from_utf8(&len_buf)
-            .map_err(|_| Error::Message("bad pkt length".to_owned()))?;
-        let len = usize::from_str_radix(len_str, 16)
-            .map_err(|_| Error::Message("bad pkt length".to_owned()))?;
-        match len {
-            0 => {
-                if seen_pack {
-                    break;
-                }
-                continue;
-            }
-            1 | 2 => continue,
-            n if n <= 4 => {
-                return Err(Error::Message(format!(
-                    "invalid pkt-line length in side-band stream: {n}"
-                )))
-            }
-            _ => {}
-        }
-        let mut payload = vec![0u8; len - 4];
-        r.read_exact(&mut payload)?;
-        if payload.is_empty() {
-            continue;
-        }
-        match payload[0] {
-            1 => append_pack_data(&payload[1..], out, &mut pending, &mut seen_pack),
-            2 => progress.message(&payload[1..]),
-            3 => {
-                return Err(Error::Message(format!(
-                    "remote error: {}",
-                    String::from_utf8_lossy(&payload[1..]).trim_end()
-                )))
-            }
-            _ => append_pack_data(&payload, out, &mut pending, &mut seen_pack),
+pub struct SidebandPackReader {
+    src: Box<dyn Read>,
+    /// Bytes to serve before touching `src` again, after a rewind.
+    pushback: Vec<u8>,
+    /// Everything read from `src` since the last mark, so a rewind can replay it.
+    recorded: Vec<u8>,
+    /// Emit only side-band channel 1. When false the stream is a bare packfile.
+    sideband: bool,
+    /// True until the control section has been consumed. Reading the pack before
+    /// that would swallow the ACK/NAK lines that precede it.
+    in_control: bool,
+    /// Decoded pack bytes not yet handed to the consumer.
+    ready: VecDeque<u8>,
+    /// Held back while the `PACK` magic is located across a packet boundary.
+    held: Vec<u8>,
+    seen_pack: bool,
+    finished: bool,
+    /// Where side-band progress text goes, non-null only while a pack is
+    /// being read.
+    ///
+    /// A raw pointer rather than a reference on purpose. A reference would
+    /// pin the borrow of the progress sink for the whole fetch, but the sink
+    /// is only live for the unpack that reads from this reader.
+    ///
+    /// SAFETY: unpack_into sets it immediately before the unpack and clears it
+    /// immediately after, and nothing else writes to it, so it cannot outlive
+    /// the progress reference handed to that call.
+    progress: Option<*mut (dyn Progress + 'static)>,
+}
+
+impl SidebandPackReader {
+    /// Take a response body and prepare to read the packfile out of it.
+    pub fn new(src: Box<dyn Read>, sideband: bool) -> Self {
+        Self {
+            src,
+            pushback: Vec::new(),
+            recorded: Vec::new(),
+            sideband,
+            in_control: true,
+            ready: VecDeque::new(),
+            held: Vec::new(),
+            seen_pack: false,
+            finished: false,
+            progress: None,
         }
     }
-    Ok(())
+
+    /// Forget what has been read so far, so the next read re-reads it.
+    ///
+    /// Used by the control parser: it reads a packet to see what it is, and has
+    /// to give it back when the answer turns out to be "not mine".
+    pub fn mark(&mut self) {
+        self.recorded.clear();
+    }
+
+    /// Replay everything read since the last [`mark`](Self::mark).
+    pub fn rewind(&mut self) {
+        if self.recorded.is_empty() {
+            return;
+        }
+        let mut replay = std::mem::take(&mut self.recorded);
+        replay.extend_from_slice(&self.pushback);
+        self.pushback = replay;
+    }
+
+    /// One pkt-line payload from the control section, or `None` at a flush
+    /// or the end of the response.
+    pub fn read_control_payload(&mut self) -> std::io::Result<Option<Vec<u8>>> {
+        read_pkt_payload(&mut ControlReader(self))
+    }
+
+    /// A reader over a body that has already been collected in full.
+    ///
+    /// The protocol-v2 path still de-frames into a Vec through the shared
+    /// fetch.rs helper, so it arrives here whole. It gets the same reader type
+    /// so both paths converge on one ingest; nothing about v2 streams yet.
+    pub fn from_bytes(bytes: Vec<u8>, sideband: bool) -> Self {
+        let reader = std::io::Cursor::new(bytes);
+        Self {
+            src: Box::new(reader),
+            pushback: Vec::new(),
+            recorded: Vec::new(),
+            sideband,
+            in_control: false,
+            ready: VecDeque::new(),
+            held: Vec::new(),
+            seen_pack: false,
+            finished: false,
+            progress: None,
+        }
+    }
+    /// Validate the packfile signature, then unpack straight into the odb as the
+    /// bytes arrive.
+    ///
+    /// Progress is taken here rather than held from construction so its borrow
+    /// lasts exactly as long as the unpack, instead of pinning the sink for the
+    /// whole fetch. not_a_pack is what to report when the stream does not start
+    /// with the magic, which is the job the old length-and-prefix check did.
+    pub fn unpack_into(
+        &mut self,
+        odb: &crate::odb::Odb,
+        opts: &crate::unpack_objects::UnpackOptions,
+        progress: &mut dyn Progress,
+        not_a_pack: &str,
+    ) -> Result<usize> {
+        let mut magic = [0u8; 4];
+        match self.read_exact(&mut magic) {
+            Ok(()) if &magic == b"PACK" => self.unread(&magic),
+            _ => return Err(Error::Message(not_a_pack.to_owned())),
+        }
+        // SAFETY: the erased lifetime is sound because the sink is dropped
+        // again before this function returns, so it cannot outlive the
+        // reference it was taken from.
+        self.progress = Some(unsafe {
+            std::mem::transmute::<*mut dyn Progress, *mut (dyn Progress + 'static)>(
+                std::ptr::from_mut(progress),
+            )
+        });
+        let result = crate::unpack_objects::unpack_objects(self, odb, opts);
+        self.progress = None;
+        result
+    }
+    /// One pkt-line from the control section, with the same distinctions
+    /// grit's parser makes. None means the response ended.
+    pub fn read_control_packet(&mut self) -> std::io::Result<Option<pkt_line::Packet>> {
+        pkt_line::read_packet(&mut ControlReader(self))
+    }
+
+    /// Put bytes the caller has already read back at the front of the stream.
+    ///
+    /// For peeking at the packfile signature: the consumer needs the magic
+    /// checked before [unpack_objects] sees it, and going back to the network
+    /// is not an option on a body that is not buffered.
+    pub fn unread(&mut self, data: &[u8]) {
+        let mut replay = data.to_vec();
+        replay.extend_from_slice(&self.pushback);
+        self.pushback = replay;
+    }
+    /// Hand the stream over to the packfile consumer: from here on, reads
+    /// come back as packfile bytes rather than as control lines.
+
+    pub fn begin_pack(&mut self) {
+        self.in_control = false;
+    }
+
+    /// Read from the pushback buffer first, then the body, recording what the
+    /// body produced so a rewind can replay it.
+    fn read_from_src(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if !self.pushback.is_empty() {
+            let n = self.pushback.len().min(buf.len());
+            buf[..n].copy_from_slice(&self.pushback[..n]);
+            self.pushback.drain(..n);
+            return Ok(n);
+        }
+        let n = self.src.read(buf)?;
+        self.recorded.extend_from_slice(&buf[..n]);
+        Ok(n)
+    }
+
+
+    /// Pull side-band packets until at least one pack byte is decoded.
+    fn fill(&mut self) -> std::io::Result<()> {
+        loop {
+            let Some(payload) = self.read_control_payload()? else {
+                self.finished = true;
+                return Ok(());
+            };
+            if payload.is_empty() {
+                continue;
+            }
+            match payload[0] {
+                1 => append_pack_data(
+                    &payload[1..],
+                    &mut self.ready,
+                    &mut self.held,
+                    &mut self.seen_pack,
+                ),
+                2 => {
+                    if let Some(sink) = self.progress {
+                        // SAFETY: set and cleared by unpack_into.
+                        unsafe { (*sink).message(&payload[1..]) };
+                    }
+                }
+                3 => {
+                    return Err(std::io::Error::other(format!(
+                        "remote error: {}",
+                        String::from_utf8_lossy(&payload[1..]).trim_end()
+                    )))
+                }
+                _ => append_pack_data(
+                    &payload,
+                    &mut self.ready,
+                    &mut self.held,
+                    &mut self.seen_pack,
+                ),
+            }
+            if !self.ready.is_empty() {
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// A [Read] view of the control section, for handing to grit's pkt-line parser.
+///
+/// [SidebandPackReader]'s own [Read] impl is deliberately closed while the
+/// control section is being parsed, so that nothing can make the demuxer
+/// swallow the ACK/NAK lines that precede the pack. This is the way in for a
+/// parser, and it routes through the same bookkeeping that [mark](Self::mark)
+/// and [rewind](Self::rewind) depend on.
+struct ControlReader<'a>(&'a mut SidebandPackReader);
+
+impl Read for ControlReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read_from_src(buf)
+    }
+}
+
+impl Read for SidebandPackReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.in_control {
+            return Err(std::io::Error::other(
+                "the control section must be consumed before reading the packfile"
+            ));
+        }
+        if !self.sideband {
+            // A bare packfile needs no de-framing; hand the body straight on.
+            return self.read_from_src(buf);
+        }
+        while self.ready.is_empty() {
+            if self.finished {
+                return Ok(0);
+            }
+            self.fill()?;
+        }
+        let n = self.ready.len().min(buf.len());
+        for (slot, byte) in buf.iter_mut().take(n).zip(self.ready.drain(..n)) {
+            *slot = byte;
+        }
+        Ok(n)
+    }
 }
 
 /// Append channel-1 (or raw) data to `out`, scanning for the `PACK` magic that
 /// may straddle chunk boundaries.
-fn append_pack_data(data: &[u8], out: &mut Vec<u8>, pending: &mut Vec<u8>, seen_pack: &mut bool) {
+fn append_pack_data(
+    data: &[u8],
+    out: &mut VecDeque<u8>,
+    pending: &mut Vec<u8>,
+    seen_pack: &mut bool,
+) {
     if *seen_pack {
-        out.extend_from_slice(data);
+        out.extend(data.iter().copied());
         return;
     }
     pending.extend_from_slice(data);
     if let Some(pos) = pending.windows(4).position(|w| w == b"PACK") {
         *seen_pack = true;
-        out.extend_from_slice(&pending[pos..]);
+        out.extend(pending[pos..].iter().copied());
         pending.clear();
     } else if pending.len() > 3 {
         let keep_from = pending.len() - 3;
@@ -715,29 +1013,29 @@ fn append_pack_data(data: &[u8], out: &mut Vec<u8>, pending: &mut Vec<u8>, seen_
 /// `shallow-info` section (only when `expect_shallow`, i.e. a deepen was
 /// requested), then optional `ACK`/`NAK` negotiation lines, then (if the server
 /// is generating one) the side-band pack.
+///
+/// On return `src` is handed over to the packfile: it has either been
+/// positioned at the pack, or the response held no pack at all. The pack is not
+/// collected here, because the entire point is that it never has to be.
 fn read_stateless_response(
-    resp: &[u8],
+    src: &mut SidebandPackReader,
     sideband: bool,
     expect_shallow: bool,
-    pack_buf: &mut Vec<u8>,
-    progress: &mut dyn Progress,
 ) -> Result<RoundResult> {
-    let mut cur = Cursor::new(resp);
     let mut acks = Vec::new();
-    let mut got_pack = false;
     let mut shallow = Vec::new();
     let mut unshallow = Vec::new();
+    let mut got_pack = false;
 
     // Shallow-info section: `shallow`/`unshallow` lines terminated by a flush. A
     // server with nothing to report still emits the trailing flush. Rewind and
     // fall through if the first line is not a shallow-info line (no section).
     if expect_shallow {
         loop {
-            let start = cur.position() as usize;
-            match pkt_line::read_packet(&mut cur)? {
+            src.mark();
+            match src.read_control_packet()? {
                 None | Some(pkt_line::Packet::Flush) => break,
                 Some(pkt_line::Packet::Data(line)) => {
-                    let line = line.trim_end_matches('\n');
                     if let Some(rest) = line.strip_prefix("shallow ") {
                         if let Ok(oid) = ObjectId::from_hex(rest.trim()) {
                             shallow.push(oid);
@@ -747,7 +1045,7 @@ fn read_stateless_response(
                             unshallow.push(oid);
                         }
                     } else {
-                        cur.set_position(start as u64);
+                        src.rewind();
                         break;
                     }
                 }
@@ -757,8 +1055,8 @@ fn read_stateless_response(
     }
 
     loop {
-        let start = cur.position() as usize;
-        let Some(payload) = read_pkt_payload(&mut cur)? else {
+        src.mark();
+        let Some(payload) = src.read_control_payload()? else {
             break;
         };
         if payload.is_empty() {
@@ -768,13 +1066,12 @@ fn read_stateless_response(
             (sideband && payload.first() == Some(&1) && payload.get(1..5) == Some(b"PACK"))
                 || payload.starts_with(b"PACK");
         if is_pack {
+            // Give the packet back so the demuxer re-reads it as the start of
+            // the pack, rather than the parser and the pack reader each taking
+            // a guess at where it begins.
+            src.rewind();
+            src.begin_pack();
             got_pack = true;
-            cur.set_position(start as u64);
-            if sideband {
-                read_sideband_pack(&mut cur, pack_buf, progress)?;
-            } else {
-                pack_buf.extend_from_slice(&resp[start..]);
-            }
             break;
         }
         let text = String::from_utf8_lossy(&payload);
@@ -875,9 +1172,23 @@ fn append_shallow_request_v0_http(
     Ok(())
 }
 
+/// Wrap a body that was collected whole into a reader.
+///
+/// Protocol v2 still de-frames into a Vec through the shared fetch.rs helper,
+/// so this is the one place where the pack is fully resident. The reader type
+/// is the same so both protocols converge on one ingest path, and so a future
+/// streaming v2 is a change of where the bytes come from, not of what consumes
+/// them.
+fn pack_stream(bytes: Vec<u8>, sideband: bool) -> PackStream {
+    if bytes.is_empty() {
+        None
+    } else {
+        Some(SidebandPackReader::from_bytes(bytes, sideband))
+    }
+}
 /// Negotiate and download the pack for `wants` over stateless-RPC HTTP,
-/// returning the raw pack bytes (empty if the server sent none) plus any
-/// shallow-boundary updates the server reported.
+/// returning a reader over the pack as it arrives (None if the server sent
+/// none) plus any shallow-boundary updates the server reported.
 fn negotiate_pack_http(
     client: &dyn HttpClient,
     local_git_dir: &Path,
@@ -887,8 +1198,7 @@ fn negotiate_pack_http(
     wants: &[ObjectId],
     opts: &FetchOptions,
     local_shallow: &[ObjectId],
-    progress: &mut dyn Progress,
-) -> Result<(Vec<u8>, crate::fetch::ShallowUpdate)> {
+) -> Result<(PackStream, crate::fetch::ShallowUpdate)> {
     let post_url = upload_pack_url(repo_url);
     let content_type = format!("application/x-{UPLOAD_PACK}-request");
     let accept = format!("application/x-{UPLOAD_PACK}-result");
@@ -963,9 +1273,9 @@ fn negotiate_pack_http(
         }
     }
 
-    let mut pack_buf: Vec<u8> = Vec::new();
+    // The pack is returned as a reader rather than accumulated here: the caller
+    // unpacks it as it arrives, which is what keeps a large fetch out of memory.
     let mut got_ready = false;
-    let mut got_pack = false;
     let mut shallow_applied = false;
 
     const INITIAL_FLUSH: usize = 16;
@@ -987,9 +1297,10 @@ fn negotiate_pack_http(
         pkt_line::write_flush(&mut req)?;
         round.clear();
 
-        let resp = client.post(&post_url, &content_type, &accept, &req, None)?;
-        let round_result =
-            read_stateless_response(&resp, sideband, shallow_request, &mut pack_buf, progress)?;
+        let body = client.post_streaming(&post_url, &content_type, &accept, &req, None)?;
+        let mut pack =
+            SidebandPackReader::new(Box::new(BodyReader::new(body)), sideband);
+        let round_result = read_stateless_response(&mut pack, sideband, shallow_request)?;
         if shallow_request && !shallow_applied {
             shallow_update
                 .shallow
@@ -1012,8 +1323,7 @@ fn negotiate_pack_http(
             }
         }
         if round_result.got_pack {
-            got_pack = true;
-            break;
+            return Ok((Some(pack), shallow_update));
         }
         if got_ready {
             break;
@@ -1022,20 +1332,24 @@ fn negotiate_pack_http(
 
     // Final RPC ending in `done`, unless the pack already arrived with
     // `ACK ... ready` under `no-done`.
-    if !(got_pack || got_ready && no_done) {
+    if !(got_ready && no_done) {
         let mut req = state.clone();
         pkt_line::write_line_to_vec(&mut req, "done")?;
         pkt_line::write_flush(&mut req)?;
-        let resp = client.post(&post_url, &content_type, &accept, &req, None)?;
-        let round_result =
-            read_stateless_response(&resp, sideband, shallow_request, &mut pack_buf, progress)?;
+        let body = client.post_streaming(&post_url, &content_type, &accept, &req, None)?;
+        let mut pack =
+            SidebandPackReader::new(Box::new(BodyReader::new(body)), sideband);
+        let round_result = read_stateless_response(&mut pack, sideband, shallow_request)?;
         if shallow_request && !shallow_applied {
             shallow_update.shallow.extend(round_result.shallow);
             shallow_update.unshallow.extend(round_result.unshallow);
         }
+        if round_result.got_pack {
+            return Ok((Some(pack), shallow_update));
+        }
     }
 
-    Ok((pack_buf, shallow_update))
+    Ok((None, shallow_update))
 }
 
 /// Resolve the `wants` for a fetch from the advertised refs and the matched set.
@@ -1238,23 +1552,17 @@ pub fn http_fetch(
             &need,
             opts,
             &local_shallow,
-            progress,
         )?;
         shallow_update = su;
-        if !pack.is_empty() {
-            if pack.len() < 12 || &pack[0..4] != b"PACK" {
-                return Err(Error::Message(
-                    "did not receive a valid pack from HTTP fetch".to_owned(),
-                ));
-            }
-            let mut cursor = Cursor::new(pack);
-            crate::unpack_objects::unpack_objects(
-                &mut cursor,
+        if let Some(mut pack) = pack {
+            pack.unpack_into(
                 &local_odb,
                 &crate::unpack_objects::UnpackOptions {
                     quiet: true,
                     ..Default::default()
                 },
+                progress,
+                "did not receive a valid pack from HTTP fetch",
             )?;
         }
     }
@@ -1458,20 +1766,15 @@ fn http_fetch_v2(
             progress,
         )?;
         shallow_update = su;
-        if !pack.is_empty() {
-            if pack.len() < 12 || &pack[0..4] != b"PACK" {
-                return Err(Error::Message(
-                    "did not receive a valid pack from v2 HTTP fetch".to_owned(),
-                ));
-            }
-            let mut cursor = Cursor::new(pack);
-            crate::unpack_objects::unpack_objects(
-                &mut cursor,
+        if let Some(mut pack) = pack {
+            pack.unpack_into(
                 &local_odb,
                 &crate::unpack_objects::UnpackOptions {
                     quiet: true,
                     ..Default::default()
                 },
+                progress,
+                "did not receive a valid pack from v2 HTTP fetch",
             )?;
         }
     }
@@ -1575,9 +1878,9 @@ fn negotiate_pack_v2_http(
     wants: &[ObjectId],
     deepen: &crate::fetch::V2DeepenArgs,
     progress: &mut dyn Progress,
-) -> Result<(Vec<u8>, crate::fetch::ShallowUpdate)> {
+) -> Result<(PackStream, crate::fetch::ShallowUpdate)> {
     if wants.is_empty() {
-        return Ok((Vec::new(), crate::fetch::ShallowUpdate::default()));
+        return Ok((None, crate::fetch::ShallowUpdate::default()));
     }
     let object_format = crate::fetch::v2_object_format(server_caps, local_odb);
     let cap_echo = protocol_v2::cap_lines_for_command_request(server_caps);
@@ -1621,7 +1924,7 @@ fn negotiate_pack_v2_http(
             &mut shallow_update,
             progress,
         )?;
-        return Ok((pack, shallow_update));
+        return Ok((pack_stream(pack, sideband_all), shallow_update));
     }
 
     // Batched negotiation: each round resends wants + the accumulated have prefix
@@ -1655,7 +1958,7 @@ fn negotiate_pack_v2_http(
                         &mut shallow_update,
                         progress,
                     )?;
-                    return Ok((pack, shallow_update));
+                    return Ok((pack_stream(pack, sideband_all), shallow_update));
                 }
             } else {
                 // Server skipped acknowledgments and went straight to the pack.
@@ -1665,7 +1968,7 @@ fn negotiate_pack_v2_http(
                     &mut shallow_update,
                     progress,
                 )?;
-                return Ok((pack, shallow_update));
+                return Ok((pack_stream(pack, sideband_all), shallow_update));
             }
             flush_at = next_flush(flush_at).min(haves.len());
             continue;
@@ -1691,7 +1994,7 @@ fn negotiate_pack_v2_http(
             &mut shallow_update,
             progress,
         )?;
-        return Ok((pack, shallow_update));
+        return Ok((pack_stream(pack, sideband_all), shallow_update));
     }
 }
 
