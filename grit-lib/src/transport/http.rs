@@ -848,11 +848,7 @@ impl SidebandPackReader {
         progress: &mut dyn Progress,
         not_a_pack: &str,
     ) -> Result<usize> {
-        let mut magic = [0u8; 4];
-        match self.read_exact(&mut magic) {
-            Ok(()) if &magic == b"PACK" => self.unread(&magic),
-            _ => return Err(Error::Message(not_a_pack.to_owned())),
-        }
+        self.expect_pack_magic(not_a_pack)?;
         // SAFETY: the erased lifetime is sound because the sink is dropped
         // again before this function returns, so it cannot outlive the
         // reference it was taken from.
@@ -871,15 +867,28 @@ impl SidebandPackReader {
         pkt_line::read_packet(&mut ControlReader(self))
     }
 
-    /// Put bytes the caller has already read back at the front of the stream.
+    /// Check the packfile signature without consuming it.
     ///
-    /// For peeking at the packfile signature: the consumer needs the magic
-    /// checked before [unpack_objects] sees it, and going back to the network
-    /// is not an option on a body that is not buffered.
-    pub fn unread(&mut self, data: &[u8]) {
-        let mut replay = data.to_vec();
-        replay.extend_from_slice(&self.pushback);
-        self.pushback = replay;
+    /// The old code took a length-and-prefix slice check on a body that was
+    /// already whole. With a streamed body the magic has to be inspected where
+    /// it lands, and it must be left there: the pack stream is served from
+    /// [Self::ready], so putting the bytes back anywhere else would replay them
+    /// in the middle of the pack and shift every object after it.
+    pub fn expect_pack_magic(&mut self, not_a_pack: &str) -> Result<()> {
+        while self.ready.len() < 4 {
+            if self.finished {
+                break;
+            }
+            self.fill()?;
+        }
+        // A VecDeque is not contiguous, so the magic is compared a byte at a
+        // time rather than sliced: &self.ready[..4] parses as a second index
+        // into the first element, not as a range over the queue.
+        let magic = self.ready.iter().take(4).copied().collect::<Vec<u8>>();
+        if magic.as_slice() != b"PACK" {
+            return Err(Error::Message(not_a_pack.to_owned()));
+        }
+        Ok(())
     }
     /// Hand the stream over to the packfile consumer: from here on, reads
     /// come back as packfile bytes rather than as control lines.
@@ -898,7 +907,9 @@ impl SidebandPackReader {
             return Ok(n);
         }
         let n = self.src.read(buf)?;
-        self.recorded.extend_from_slice(&buf[..n]);
+        if self.in_control {
+            self.recorded.extend_from_slice(&buf[..n]);
+        }
         Ok(n)
     }
 
@@ -979,6 +990,7 @@ impl Read for SidebandPackReader {
             self.fill()?;
         }
         let n = self.ready.len().min(buf.len());
+
         for (slot, byte) in buf.iter_mut().take(n).zip(self.ready.drain(..n)) {
             *slot = byte;
         }
@@ -2163,5 +2175,113 @@ mod tests {
             upload_pack_url("http://h/r.git/"),
             "http://h/r.git/git-upload-pack"
         );
+    }
+}
+
+#[cfg(test)]
+mod streaming_reader_tests {
+    use super::*;
+
+    /// A packfile with no objects: a header and a trailing checksum. Enough to
+    /// prove the framing is byte-exact.
+    fn empty_pack() -> Vec<u8> {
+        let mut pack = b"PACK".to_vec();
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&0u32.to_be_bytes());
+        pack.extend_from_slice(&[0u8; 20]);
+        pack
+    }
+
+    /// Wrap a payload in a pkt-line, optionally with the side-band channel
+    /// byte Git uses for a fetch response.
+    fn pkt_line(payload: &[u8], channel: Option<u8>) -> Vec<u8> {
+        let mut body = Vec::new();
+        if let Some(channel) = channel {
+            body.push(channel);
+        }
+        body.extend_from_slice(payload);
+        let mut out = format!("{:04x}", body.len() + 4).into_bytes();
+        out.extend_from_slice(&body);
+        out
+    }
+
+    /// A body that hands out one byte at a time, the worst case for a reader
+    /// that is counting on chunk boundaries meaning nothing.
+    struct Dribble {
+        bytes: Vec<u8>,
+        at: usize,
+    }
+
+    impl HttpBody for Dribble {
+        fn next_chunk(&mut self) -> Result<Option<Vec<u8>>> {
+            if self.at >= self.bytes.len() {
+                return Ok(None);
+            }
+            let end = (self.at + 1).min(self.bytes.len());
+            let chunk = self.bytes[self.at..end].to_vec();
+            self.at = end;
+            Ok(Some(chunk))
+        }
+    }
+
+    fn reader(body: Vec<u8>, sideband: bool) -> SidebandPackReader {
+        let dribble = Dribble { bytes: body, at: 0 };
+        SidebandPackReader::new(Box::new(BodyReader::new(Box::new(dribble))), sideband)
+    }
+
+    /// The control section, then the pack, then the pack is read back and must
+    /// come out byte for byte.
+    #[test]
+    fn pack_after_control_section_reads_back_exactly() {
+        let pack = empty_pack();
+        let mut body = pkt_line(b"NAK\n", None);
+        body.extend_from_slice(&pkt_line(&pack, Some(1)));
+        let mut src = reader(body, true);
+
+        // Drive the control parser the way read_stateless_response does.
+        src.mark();
+        let first = src.read_control_payload().unwrap().unwrap();
+        assert_eq!(first, b"NAK\n");
+        src.rewind();
+        src.begin_pack();
+
+        let mut got = Vec::new();
+        let mut buffer = [0u8; 7];
+        loop {
+            let n = std::io::Read::read(&mut src, &mut buffer).unwrap();
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&buffer[..n]);
+        }
+        assert_eq!(got, pack, "the pack must come back byte for byte");
+    }
+
+    /// The same thing with the whole pack delivered in side-band chunks, which
+    /// is how a real server splits a large packfile.
+    #[test]
+    fn pack_split_across_many_sideband_chunks() {
+        let pack = empty_pack();
+        let mut body = pkt_line(b"NAK\n", None);
+        for piece in pack.chunks(5) {
+            body.extend_from_slice(&pkt_line(piece, Some(1)));
+        }
+        let mut src = reader(body, true);
+
+        src.mark();
+        let _ = src.read_control_payload().unwrap().unwrap();
+        src.rewind();
+        src.begin_pack();
+
+        let mut got = Vec::new();
+        let mut buffer = [0u8; 3];
+        loop {
+            let n = std::io::Read::read(&mut src, &mut buffer).unwrap();
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&buffer[..n]);
+        }
+        assert_eq!(got, pack, "chunking must not change the bytes");
     }
 }
