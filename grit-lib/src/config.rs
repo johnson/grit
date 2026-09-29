@@ -420,7 +420,7 @@ fn entry_line_value_has_unclosed_quote(line: &str) -> bool {
                 in_quote = !in_quote;
                 last_was_backslash = false;
             }
-            '\\' if in_quote && !last_was_backslash => {
+            '\\' if !last_was_backslash => {
                 last_was_backslash = true;
                 continue;
             }
@@ -487,7 +487,7 @@ fn strip_inline_comment(s: &str) -> String {
                 in_quote = !in_quote;
                 result.push(ch);
             }
-            '\\' if in_quote => {
+            '\\' => {
                 result.push(ch);
                 if let Some(&next) = chars.peek() {
                     result.push(next);
