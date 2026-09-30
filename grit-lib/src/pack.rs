@@ -417,6 +417,24 @@ mod pack_cache {
         }
     }
 
+    /// Whether `idx_path` predates the pack it indexes.
+    ///
+    /// Only a strictly newer pack counts as stale. Both timestamps are compared
+    /// at one-second resolution, so an index written in the same second as its
+    /// pack is treated as current; being wrong that way costs a re-read, while
+    /// the opposite error costs a phantom commit in the user's history.
+    fn index_is_stale_against_pack(idx_path: &Path, pack_path: &Path) -> bool {
+        let (Ok(idx_meta), Ok(pack_meta)) = (fs::metadata(idx_path), fs::metadata(pack_path)) else {
+            // Unreadable metadata is not evidence of staleness; fall through to
+            // the existing existence checks.
+            return false;
+        };
+        let (Ok(idx_time), Ok(pack_time)) = (idx_meta.modified(), pack_meta.modified()) else {
+            return false;
+        };
+        pack_time > idx_time
+    }
+
     /// Get all `.idx` files for `objects_dir`, with each parsed index served from cache.
     /// The directory listing itself is cached and invalidated by the directory mtime.
     pub fn get_dir_indexes(objects_dir: &Path) -> Result<Vec<Arc<PackIndex>>> {
@@ -457,6 +475,18 @@ mod pack_cache {
             }
             let Ok(idx) = get_index(&path) else { continue };
             if !idx.pack_path.is_file() {
+                continue;
+            }
+            // A `.idx` describes exactly one `.pack`: the one it was generated
+            // from. Git never appends to a pack, so a pack whose mtime is newer
+            // than its index means the pack was replaced and the index was never
+            // regenerated. Trusting it then invents objects that are not in the
+            // store -- an `exists` check answers "yes" for a commit the read
+            // path cannot find, and the user is shown a history row that points
+            // at nothing. Skipping the stale index makes both paths agree on
+            // "absent", which is the honest answer until `git index-pack`
+            // regenerates it.
+            if index_is_stale_against_pack(&path, &idx.pack_path) {
                 continue;
             }
             out.push(idx);

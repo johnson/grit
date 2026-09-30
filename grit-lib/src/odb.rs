@@ -1135,4 +1135,93 @@ mod tests {
         let oid = Odb::hash_object_data(ObjectKind::Blob, b"hello");
         assert_eq!(oid.to_hex(), "b6fc4c620b67d95f953a5c1c1230aaab5db5a1b0");
     }
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// The two halves of the odb have to agree. A pack that was replaced without
+    /// its index being regenerated used to make `exists` answer from the old
+    /// index while `read` went to the new pack, so a caller was told a commit
+    /// was present, handed a hash, and then failed reading it -- the user saw a
+    /// history row pointing at nothing.
+    #[test]
+    fn exists_and_read_agree_when_a_pack_outlives_its_index() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-q"]);
+        std::fs::write(root.join("f"), b"payload").unwrap();
+        git(root, &["add", "f"]);
+        git(root, &["-c", "user.email=t@e", "-c", "user.name=t", "commit", "-qm", "c"]);
+        // Pack it, so the object leaves the loose store entirely.
+        git(root, &["repack", "-adq"]);
+        let oid: ObjectId = git(root, &["rev-parse", "HEAD:f"]).parse().expect("oid");
+        let objects_dir = root.join(".git/objects");
+
+        // Baseline: packed and readable.
+        crate::pack::clear_pack_cache();
+        let odb = Odb::new(&objects_dir);
+        assert!(odb.exists(&oid), "a packed object must be found");
+        assert_eq!(odb.read(&oid).unwrap().data, b"payload");
+
+        // The pack is replaced but its index is left behind. Real repositories
+        // reach this state when packs are re-fetched and `git index-pack` never
+        // runs; the mtimes are all the odb has to go on.
+        let Ok(packs) = std::fs::read_dir(objects_dir.join("pack")) else {
+            eprintln!("no pack dir; skipping");
+            return;
+        };
+        let Some(pack) = packs
+            .filter_map(std::result::Result::ok)
+            .map(|e| e.path())
+            .find(|p| p.extension().and_then(|s| s.to_str()) == Some("pack"))
+        else {
+            eprintln!("no pack produced; skipping");
+            return;
+        };
+        let idx = pack.with_extension("idx");
+        if !idx.is_file() {
+            eprintln!("no idx beside the pack; skipping");
+            return;
+        }
+        // Backdate the index rather than forward-dating the pack: this is the
+        // shape a real repository has (packs re-fetched on 9/30, indexes still
+        // from 9/1), and it needs no permissions beyond the ones the test
+        // already has on its own temporary directory.
+        let status = std::process::Command::new("touch")
+            .args(["-t", "202001010000"])
+            .arg(&idx)
+            .status();
+        if !matches!(status, Ok(s) if s.success()) {
+            eprintln!("cannot set mtimes; skipping");
+            return;
+        }
+        let (Ok(idx_time), Ok(pack_time)) = (
+            std::fs::metadata(&idx).and_then(|m| m.modified()),
+            std::fs::metadata(&pack).and_then(|m| m.modified()),
+        ) else {
+            eprintln!("cannot read mtimes; skipping");
+            return;
+        };
+        assert!(pack_time > idx_time, "test setup failed to make the index stale");
+
+        crate::pack::clear_pack_cache();
+        let odb = Odb::new(&objects_dir);
+        assert_eq!(
+            odb.exists(&oid),
+            odb.read(&oid).is_ok(),
+            "a stale index must not make one half of the odb disagree with the other"
+        );
+        assert!(!odb.exists(&oid), "a replaced pack must not keep answering as present");
+    }
 }
