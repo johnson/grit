@@ -1194,10 +1194,66 @@ mod tests {
             eprintln!("no idx beside the pack; skipping");
             return;
         }
-        // Backdate the index rather than forward-dating the pack: this is the
-        // shape a real repository has (packs re-fetched on 9/30, indexes still
-        // from 9/1), and it needs no permissions beyond the ones the test
-        // already has on its own temporary directory.
+        // Put a *different* packfile's trailing checksum in place of this
+        // one. That is the state being modelled -- the bytes beside the index
+        // are not the pack the index describes -- expressed in a way the check
+        // can actually observe, since timestamps alone cannot: a copy onto a
+        // device routinely leaves a pack newer than its own matched index.
+        let mut bytes = std::fs::read(&pack).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        let mut perms = std::fs::metadata(&pack).unwrap().permissions();
+        perms.set_readonly(false);
+        std::fs::set_permissions(&pack, perms).unwrap();
+        std::fs::write(&pack, &bytes).unwrap();
+
+        crate::pack::clear_pack_cache();
+        let odb = Odb::new(&objects_dir);
+        assert_eq!(
+            odb.exists(&oid),
+            odb.read(&oid).is_ok(),
+            "a stale index must not make one half of the odb disagree with the other"
+        );
+        assert!(!odb.exists(&oid), "a replaced pack must not keep answering as present");
+    }
+
+    /// The device case that the timestamp rule got wrong.
+    ///
+    /// A repository copied onto a phone keeps its index files at whatever time
+    /// they were last written locally and stamps the packs with the copy time,
+    /// so every pack ends up hours "newer" than its own -- perfectly matched
+    /// index. A rule that reads that as staleness drops every pack in the
+    /// repository, and the app reports the whole history as missing.
+    #[test]
+    fn a_pack_newer_than_its_own_index_still_answers() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-q"]);
+        std::fs::write(root.join("f"), b"payload").unwrap();
+        git(root, &["add", "f"]);
+        git(root, &["-c", "user.email=t@e", "-c", "user.name=t", "commit", "-qm", "c"]);
+        git(root, &["repack", "-adq"]);
+        let oid: ObjectId = git(root, &["rev-parse", "HEAD:f"]).parse().expect("oid");
+        let objects_dir = root.join(".git/objects");
+
+        let Ok(packs) = std::fs::read_dir(objects_dir.join("pack")) else {
+            eprintln!("no pack dir; skipping");
+            return;
+        };
+        let Some(pack) = packs
+            .filter_map(std::result::Result::ok)
+            .map(|e| e.path())
+            .find(|p| p.extension().and_then(|s| s.to_str()) == Some("pack"))
+        else {
+            eprintln!("no pack produced; skipping");
+            return;
+        };
+        let idx = pack.with_extension("idx");
+        if !idx.is_file() {
+            eprintln!("no idx beside the pack; skipping");
+            return;
+        }
+        // Push the index back two hours, matching what a device transfer does.
         let status = std::process::Command::new("touch")
             .args(["-t", "202001010000"])
             .arg(&idx)
@@ -1213,15 +1269,14 @@ mod tests {
             eprintln!("cannot read mtimes; skipping");
             return;
         };
-        assert!(pack_time > idx_time, "test setup failed to make the index stale");
+        assert!(pack_time > idx_time, "test setup failed to make the pack look newer");
 
         crate::pack::clear_pack_cache();
         let odb = Odb::new(&objects_dir);
-        assert_eq!(
+        assert!(
             odb.exists(&oid),
-            odb.read(&oid).is_ok(),
-            "a stale index must not make one half of the odb disagree with the other"
+            "a pack that is only newer than its own matched index must still be read"
         );
-        assert!(!odb.exists(&oid), "a replaced pack must not keep answering as present");
+        assert_eq!(odb.read(&oid).unwrap().data, b"payload");
     }
 }

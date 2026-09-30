@@ -323,7 +323,7 @@ mod pack_cache {
     use super::{read_pack_index_no_verify, Error, ObjectKind, PackIndex, Result};
     use std::collections::{HashMap, VecDeque};
     use std::fs;
-    use std::io;
+    use std::io::{self, Read, Seek};
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex, OnceLock};
     use std::time::SystemTime;
@@ -417,22 +417,55 @@ mod pack_cache {
         }
     }
 
-    /// Whether `idx_path` predates the pack it indexes.
+    /// True only when the index provably describes a *different* pack than the
+    /// one sitting next to it.
     ///
-    /// Only a strictly newer pack counts as stale. Both timestamps are compared
-    /// at one-second resolution, so an index written in the same second as its
-    /// pack is treated as current; being wrong that way costs a re-read, while
-    /// the opposite error costs a phantom commit in the user's history.
+    /// The obvious test -- "the pack was modified after the index, so the index
+    /// may be stale" -- is wrong the moment the repository is copied. A copy can
+    /// leave a pack with a newer mtime than its own index while both files are
+    /// perfectly matched, and treating that as staleness hides *every* object in
+    /// the pack. That is not hypothetical: a repository transferred to a device
+    /// lands with each file stamped at its own write time, and the app then
+    /// reports the whole pack as missing.
+    ///
+    /// So compare content instead. A packfile ends with its own checksum, and a
+    /// v2 index ends with that same checksum followed by the index's own. When
+    /// the two agree the index belongs to this pack, whatever the mtimes say.
     fn index_is_stale_against_pack(idx_path: &Path, pack_path: &Path) -> bool {
-        let (Ok(idx_meta), Ok(pack_meta)) = (fs::metadata(idx_path), fs::metadata(pack_path)) else {
-            // Unreadable metadata is not evidence of staleness; fall through to
-            // the existing existence checks.
-            return false;
-        };
-        let (Ok(idx_time), Ok(pack_time)) = (idx_meta.modified(), pack_meta.modified()) else {
-            return false;
-        };
-        pack_time > idx_time
+        // Both hash families are tried rather than inferred from the pack's
+        // length: any pack large enough to hold a SHA-1 trailer is also large
+        // enough to hold a SHA-256 one, so length says nothing.
+        let pack20 = read_trailing_bytes(pack_path, 20);
+        let idx40 = read_trailing_bytes(idx_path, 40);
+        if let (Some(p), Some(i)) = (&pack20, &idx40) {
+            if p[..] == i[..20] {
+                return false;
+            }
+        }
+        let pack32 = read_trailing_bytes(pack_path, 32);
+        let idx64 = read_trailing_bytes(idx_path, 64);
+        if let (Some(p), Some(i)) = (&pack32, &idx64) {
+            if p[..] == i[..32] {
+                return false;
+            }
+        }
+        // No trailer pair could be read at all: that is an unreadable file,
+        // not evidence that the index is stale. Anything readable that failed
+        // to match is the real thing: these are not each other's pack.
+        pack20.is_some() || idx40.is_some() || pack32.is_some() || idx64.is_some()
+    }
+
+    /// The final `n` bytes of a file, or `None` if it is shorter or unreadable.
+    fn read_trailing_bytes(path: &Path, n: usize) -> Option<Vec<u8>> {
+        let mut file = fs::File::open(path).ok()?;
+        let len = file.metadata().ok()?.len();
+        if len < n as u64 {
+            return None;
+        }
+        file.seek(io::SeekFrom::Start(len - n as u64)).ok()?;
+        let mut buf = vec![0u8; n];
+        file.read_exact(&mut buf).ok()?;
+        Some(buf)
     }
 
     /// Get all `.idx` files for `objects_dir`, with each parsed index served from cache.
