@@ -1903,6 +1903,10 @@ pub struct DiffIndexToWorktreeOptions {
     /// When true, a populated gitlink checkout whose `.git` indirection cannot resolve to a HEAD
     /// is returned as an error instead of a normal modified gitlink.
     pub error_on_broken_gitlinks: bool,
+    /// `Some(false)` mirrors git's `core.filemode=false`: the execute bit on
+    /// disk carries no information, so a mode-only difference is not a change.
+    /// `None` keeps the historical behaviour of trusting the bit.
+    pub core_filemode: Option<bool>,
 }
 
 /// Compare the index against the working tree with optional racy-timestamp context.
@@ -1926,6 +1930,53 @@ pub fn diff_index_to_worktree_with_options(
     index: &Index,
     work_tree: &Path,
     options: DiffIndexToWorktreeOptions,
+) -> Result<Vec<DiffEntry>> {
+    diff_index_to_worktree_inner(odb, index, work_tree, options, None)
+}
+
+/// The stat tuple a status pass read for an entry it had to hash, for the
+/// entries it then found unchanged.
+///
+/// Status has to hash every entry whose stat data does not match the index,
+/// which on a repository whose files were written by another machine means
+/// most of them, every time. The stat data it just read makes the next pass
+/// a fast-path hit, so a caller that writes the index back should apply these.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatRefresh {
+    /// The index path this belongs to, in the index's own bytes.
+    pub path: Vec<u8>,
+    pub ctime_sec: u32,
+    pub ctime_nsec: u32,
+    pub mtime_sec: u32,
+    pub mtime_nsec: u32,
+    pub dev: u32,
+    pub ino: u32,
+    pub size: u32,
+}
+
+/// [`diff_index_to_worktree_with_options`], plus the stat data worth keeping.
+///
+/// Only entries that hashed to the blob the index already records are
+/// reported: their stat data is the only thing that was stale, so refreshing
+/// it cannot hide a change. A file that really did change keeps its old stat
+/// data and gets hashed again next time, which is what git does too.
+pub fn diff_index_to_worktree_refreshing(
+    odb: &Odb,
+    index: &Index,
+    work_tree: &Path,
+    options: DiffIndexToWorktreeOptions,
+) -> Result<(Vec<DiffEntry>, Vec<StatRefresh>)> {
+    let mut refresh = Vec::new();
+    let entries = diff_index_to_worktree_inner(odb, index, work_tree, options, Some(&mut refresh))?;
+    Ok((entries, refresh))
+}
+
+fn diff_index_to_worktree_inner(
+    odb: &Odb,
+    index: &Index,
+    work_tree: &Path,
+    options: DiffIndexToWorktreeOptions,
+    mut refresh: Option<&mut Vec<StatRefresh>>,
 ) -> Result<Vec<DiffEntry>> {
     use crate::config::ConfigSet;
     use crate::crlf;
@@ -2165,7 +2216,8 @@ pub fn diff_index_to_worktree_with_options(
                 });
             }
             Ok(meta) => {
-                let worktree_mode = mode_from_metadata(&meta);
+                let worktree_mode =
+                    mode_from_metadata_honoring_filemode(&meta, ie.mode, options.core_filemode);
                 let stat_same = stat_matches(ie, &meta);
                 // Mode-only change: stat still matches the index entry but executable bit differs.
                 if stat_same && worktree_mode != ie.mode {
@@ -2226,6 +2278,11 @@ pub fn diff_index_to_worktree_with_options(
                         new_oid: eff_oid,
                     score: None,
                     });
+                } else if let Some(refresh) = refresh.as_deref_mut() {
+                    // Unchanged content, stale stat data: the stat tuple just
+                    // read is the truth, and keeping it turns the next pass
+                    // into a fast-path hit instead of another full rehash.
+                    refresh.push(stat_refresh_from(&meta, path_str_ref));
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound
@@ -2285,7 +2342,8 @@ pub fn diff_index_to_worktree_with_options(
                 &path,
                 Some(base_entry),
             )?;
-            let wt_mode = mode_from_metadata(&meta);
+            let wt_mode =
+                mode_from_metadata_honoring_filemode(&meta, base_entry.mode, options.core_filemode);
             if wt_oid != base_entry.oid || wt_mode != base_entry.mode {
                 result.push(DiffEntry {
                     status: DiffStatus::Modified,
@@ -2342,6 +2400,20 @@ impl SymlinkDirCache {
             }
         }
         false
+    }
+}
+
+/// The stat fields an index entry caches for a file, read from the file.
+fn stat_refresh_from(meta: &fs::Metadata, path: &str) -> StatRefresh {
+    StatRefresh {
+        path: path.as_bytes().to_vec(),
+        ctime_sec: meta.ctime() as u32,
+        ctime_nsec: meta.ctime_nsec() as u32,
+        mtime_sec: meta.mtime() as u32,
+        mtime_nsec: meta.mtime_nsec() as u32,
+        dev: meta.dev() as u32,
+        ino: meta.ino() as u32,
+        size: meta.len().min(u64::from(u32::MAX)) as u32,
     }
 }
 
@@ -2655,6 +2727,27 @@ pub fn mode_from_metadata(meta: &fs::Metadata) -> u32 {
     }
 }
 
+/// Derive a Git file mode for a worktree file, honouring `core.filemode`.
+///
+/// git only trusts the execute bit when `core.filemode` is true. With it false
+/// the bit says nothing about the file, so reporting a mode-only difference
+/// turns a whole filesystem quirk into a whole-repository diff: on the iPad,
+/// where the checkout left tracked files as `700`, that was 9763 "modified"
+/// files that no one had touched. Handing back the recorded mode keeps every
+/// caller that compares against the index behaving the same way, rather than
+/// each one re-deriving the bit and forgetting to ask.
+pub fn mode_from_metadata_honoring_filemode(
+    meta: &fs::Metadata,
+    recorded: u32,
+    core_filemode: Option<bool>,
+) -> u32 {
+    if core_filemode == Some(false) {
+        recorded
+    } else {
+        mode_from_metadata(meta)
+    }
+}
+
 /// Compare a tree against the working tree.
 ///
 /// Shows changes from `tree_oid` to the current working directory state.
@@ -2676,6 +2769,18 @@ pub fn diff_tree_to_worktree(
     tree_oid: Option<&ObjectId>,
     work_tree: &Path,
     index: &Index,
+) -> Result<Vec<DiffEntry>> {
+    diff_tree_to_worktree_with_core_filemode(odb, tree_oid, work_tree, index, None)
+}
+
+/// `diff_tree_to_worktree` with the `core.filemode` answer passed in: `Some(false)`
+/// stops a mode-only difference from being reported, `None` trusts the bit.
+pub fn diff_tree_to_worktree_with_core_filemode(
+    odb: &Odb,
+    tree_oid: Option<&ObjectId>,
+    work_tree: &Path,
+    index: &Index,
+    core_filemode: Option<bool>,
 ) -> Result<Vec<DiffEntry>> {
     use crate::config::ConfigSet;
     use crate::crlf;
@@ -2829,7 +2934,7 @@ pub fn diff_tree_to_worktree(
                 let file_attrs = crlf::get_file_attrs(&attrs, path, false, &config);
                 let wt_oid =
                     hash_worktree_file(odb, &file_path, meta, &conv, &file_attrs, path, None)?;
-                let wt_mode = mode_from_metadata(meta);
+                let wt_mode = mode_from_metadata_honoring_filemode(meta, te.mode, core_filemode);
                 if wt_oid != te.oid || wt_mode != te.mode {
                     result.push(DiffEntry {
                         status: DiffStatus::Modified,
@@ -2848,7 +2953,7 @@ pub fn diff_tree_to_worktree(
 
         match (tree_entry, wt_meta) {
             (Some(te), Some(ref meta)) => {
-                let wt_mode = mode_from_metadata(meta);
+                let wt_mode = mode_from_metadata_honoring_filemode(meta, te.mode, core_filemode);
                 let Some(ie) = index_entries.get(path.as_bytes()) else {
                     continue;
                 };

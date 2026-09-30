@@ -739,18 +739,44 @@ pub fn status(
             .collect();
 
     // Unstaged: worktree vs index, narrowed before rename detection.
-    let mut unstaged: Vec<DiffEntry> = crate::diff::diff_index_to_worktree_with_options(
+    //
+    // core.filemode=false is git's "this filesystem's execute bit means
+    // nothing" switch, and init turns it on by itself when the bits disagree
+    // with the index. Honouring it here is what stops a checkout that left
+    // every tracked file as 700 from looking like a 9763-file change.
+    let core_filemode = crate::config::ConfigSet::load(Some(&repo.git_dir), true)
+        .ok()
+        .and_then(|config| config.get_bool("core.filemode").and_then(|result| result.ok()));
+    let (mut unstaged, stat_refresh) = crate::diff::diff_index_to_worktree_refreshing(
         &repo.odb,
         &index,
         work_tree,
         crate::diff::DiffIndexToWorktreeOptions {
             ignore_submodule_untracked: opts.untracked == UntrackedMode::No,
+            core_filemode,
             ..Default::default()
         },
-    )?
-    .into_iter()
-    .filter(|e| status_path_matches(e.path(), &opts.pathspecs))
-    .collect();
+    )?;
+    unstaged.retain(|e| status_path_matches(e.path(), &opts.pathspecs));
+
+    // Write the refreshed stat data back, which is the whole reason the diff is
+    // worth doing: a pass that had to hash a file now leaves behind the stat
+    // tuple that made hashing necessary, so the next pass is a stat comparison.
+    // Without this, a repository whose files were written by another device --
+    // cloned on a Mac, pulled on an iPad -- rehashes all fifteen thousand of
+    // them on every single status call, and the app calls status often.
+    let refreshed = apply_stat_refresh(&mut index, &stat_refresh, &opts.pathspecs);
+    if refreshed > 0 && !index_sparse_on_disk {
+        // The cache tree stays: only stat data changed, so the tree it names
+        // is still the tree the index describes.
+        if let Err(error) = index.write(&index_path) {
+            // A status that cannot record what it learned is still a correct
+            // status, only a slower next one -- and git does not fail status
+            // for this either, so neither does this. Say so on the sink, which
+            // is where the other status narration goes, and carry on.
+            progress.message(&format!("status: index refresh not written: {error}"));
+        }
+    }
 
     if let Some(rd) = opts.renames {
         staged = apply_status_renames(&repo.odb, staged, rd, head_tree.as_ref())?;
@@ -789,6 +815,42 @@ pub fn status(
         index_sparse_on_disk,
         sparse_directory_prefixes,
     })
+}
+
+/// Copy refreshed stat data into index entries. Returns how many entries moved.
+///
+/// Only the cached stat tuple is touched: object ids and modes are the tree's
+/// business, and a refresh that changed either would be a silent commit.
+/// Entries outside the pathspec are left alone -- a narrowed status must not
+/// claim knowledge about the rest of the tree.
+fn apply_stat_refresh(
+    index: &mut Index,
+    refresh: &[crate::diff::StatRefresh],
+    pathspecs: &[String],
+) -> usize {
+    let mut applied = 0;
+    for item in refresh {
+        let path = String::from_utf8_lossy(&item.path).to_string();
+        if !status_path_matches(&path, pathspecs) {
+            continue;
+        }
+        let Some(entry) = index
+            .entries
+            .iter_mut()
+            .find(|entry| entry.path == item.path)
+        else {
+            continue;
+        };
+        entry.ctime_sec = item.ctime_sec;
+        entry.ctime_nsec = item.ctime_nsec;
+        entry.mtime_sec = item.mtime_sec;
+        entry.mtime_nsec = item.mtime_nsec;
+        entry.dev = item.dev;
+        entry.ino = item.ino;
+        entry.size = item.size;
+        applied += 1;
+    }
+    applied
 }
 
 /// Apply status rename (and optionally copy) detection, mirroring git's

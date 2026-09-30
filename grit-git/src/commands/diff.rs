@@ -29,7 +29,8 @@ use grit_lib::crlf::{get_file_attrs, parse_gitattributes_content, DiffAttr};
 use grit_lib::diff::{
     anchored_unified_diff, count_changes, count_changes_with_algorithm, count_git_lines,
     detect_copies, detect_renames, diff_index_to_tree, diff_index_to_worktree,
-    diff_slice_ops_compacted, diff_tree_to_worktree, diff_trees, diffcore_count_changes,
+    diff_index_to_worktree_with_options, DiffIndexToWorktreeOptions, diff_slice_ops_compacted,
+    diff_tree_to_worktree_with_core_filemode, diff_trees, diffcore_count_changes,
     empty_blob_oid, format_stat_line, resolve_indent_heuristic,
     rewrite_dissimilarity_index_percent, should_break_rewrite_for_stat,
     unified_diff_histogram_hunks_only, unified_diff_with_prefix,
@@ -3007,6 +3008,12 @@ pub fn run(mut args: Args) -> Result<()> {
             })
             .collect()
     } else {
+        // git trusts the execute bit only while core.filemode is true; otherwise a
+        // checkout that left every tracked file executable shows up as a diff of the
+        // whole tree, with no content change behind it.
+        let core_filemode = grit_lib::config::ConfigSet::load(Some(&repo.git_dir), true)
+            .ok()
+            .and_then(|config| config.get_bool("core.filemode").and_then(|result| result.ok()));
         match (args.cached, revs.len()) {
             (true, 0) => {
                 // --cached with no revision: index vs HEAD
@@ -3021,14 +3028,28 @@ pub fn run(mut args: Args) -> Result<()> {
                 // No flags: unstaged changes (index vs worktree)
                 let wt = work_tree
                     .ok_or_else(|| anyhow::anyhow!("this operation must be run in a work tree"))?;
-                diff_index_to_worktree(&repo.odb, &index, wt, false, false)?
+                diff_index_to_worktree_with_options(
+                    &repo.odb,
+                    &index,
+                    wt,
+                    DiffIndexToWorktreeOptions {
+                        core_filemode,
+                        ..Default::default()
+                    },
+                )?
             }
             (false, 1) => {
                 // One revision: tree vs worktree
                 let tree_oid = commit_or_tree_oid(&repo, &revs[0])?;
                 let wt = work_tree
                     .ok_or_else(|| anyhow::anyhow!("this operation must be run in a work tree"))?;
-                diff_tree_to_worktree(&repo.odb, Some(&tree_oid), wt, &index)?
+                diff_tree_to_worktree_with_core_filemode(
+                    &repo.odb,
+                    Some(&tree_oid),
+                    wt,
+                    &index,
+                    core_filemode,
+                )?
             }
             (_, 2) => {
                 match (

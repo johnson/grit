@@ -631,6 +631,13 @@ pub fn run(mut args: Args) -> Result<()> {
         staged_raw
     };
 
+    // git trusts the execute bit only while core.filemode is true. Without this a
+    // checkout that left every tracked file executable reads as a whole-repository
+    // change, which is the iPad's 9763-file phantom diff.
+    let core_filemode = config
+        .get_bool("core.filemode")
+        .and_then(|result| result.ok());
+
     // Diff: unstaged (worktree vs index), narrowed before rename detection.
     let unstaged_raw = diff_index_to_worktree_with_options(
         &repo.odb,
@@ -639,6 +646,7 @@ pub fn run(mut args: Args) -> Result<()> {
         DiffIndexToWorktreeOptions {
             index_mtime: Some(index_mtime),
             ignore_submodule_untracked: untracked_mode == "no",
+            core_filemode,
             ..Default::default()
         },
     )?;

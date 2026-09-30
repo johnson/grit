@@ -64,7 +64,13 @@ pub fn run(mut args: Args) -> Result<()> {
     let index = repo.load_index_at(&index_path).context("loading index")?;
     let index_mtime = index_file_mtime_pair(&index_path);
 
-    let changes = collect_changes(&repo, &index, &work_tree, &options, index_mtime)?;
+    // git trusts the execute bit only while core.filemode is true; init sets
+    // it to false by itself when the bits on disk disagree with the index.
+    let core_filemode = diff_cfg
+        .get_bool("core.filemode")
+        .and_then(|result| result.ok())
+        .unwrap_or(true);
+    let changes = collect_changes(&repo, &index, &work_tree, &options, index_mtime, core_filemode)?;
 
     let mut diff_entries: Vec<DiffEntry> = changes.iter().map(change_to_diff_entry).collect();
 
@@ -931,6 +937,7 @@ fn collect_changes(
     work_tree: &Path,
     options: &Options,
     index_mtime: Option<(u32, u32)>,
+    core_filemode: bool,
 ) -> Result<Vec<Change>> {
     // Collect index entries, grouped by path.  For stage==0 we use merged
     // entries (stage 0).  For stage 1–3 we use that specific unmerged stage.
@@ -980,7 +987,7 @@ fn collect_changes(
         // Use stat info to skip unchanged files (avoid hashing).
         for (path, (idx_mode, idx_oid, idx_entry)) in &stage0 {
             let abs = work_tree.join(path);
-            match read_worktree_info_fast(repo, work_tree, &abs, idx_entry, index_mtime)? {
+            match read_worktree_info_fast(repo, work_tree, &abs, idx_entry, index_mtime, core_filemode)? {
                 WorktreeStatus::Unchanged => { /* skip — stat says identical */ }
                 WorktreeStatus::Modified(wt_mode, wt_oid) => {
                     let idx_canonical = canonicalize_mode(*idx_mode);
@@ -1875,12 +1882,29 @@ fn index_entry_is_racy(index_entry: &IndexEntry, index_mtime: Option<(u32, u32)>
         || (index_mtime_sec == index_entry.mtime_sec && index_mtime_nsec <= index_entry.mtime_nsec)
 }
 
+/// The mode a worktree file should be reported as.
+///
+/// git trusts the execute bit only while core.filemode is true. With it false
+/// the recorded mode is handed straight back, so a filesystem that hands out
+/// `700` on every tracked file stops reading as a whole-repository change.
+fn worktree_mode(meta: &fs::Metadata, index_entry: &IndexEntry, core_filemode: bool) -> u32 {
+    if !core_filemode {
+        return canonicalize_mode(index_entry.mode);
+    }
+    if meta.permissions().mode() & 0o111 != 0 {
+        MODE_EXECUTABLE
+    } else {
+        MODE_REGULAR
+    }
+}
+
 fn read_worktree_info_fast(
     repo: &Repository,
     super_worktree: &Path,
     abs_path: &Path,
     index_entry: &IndexEntry,
     index_mtime: Option<(u32, u32)>,
+    core_filemode: bool,
 ) -> Result<WorktreeStatus> {
     if index_entry.assume_unchanged() || index_entry.skip_worktree() {
         return Ok(WorktreeStatus::Unchanged);
@@ -1918,14 +1942,9 @@ fn read_worktree_info_fast(
             return Ok(WorktreeStatus::Modified(MODE_SYMLINK, oid));
         }
         if meta.file_type().is_file() {
-            let mode = if meta.permissions().mode() & 0o111 != 0 {
-                MODE_EXECUTABLE
-            } else {
-                MODE_REGULAR
-            };
             let data = fs::read(abs_path)?;
             let oid = Odb::hash_object_data(ObjectKind::Blob, &data);
-            return Ok(WorktreeStatus::Modified(mode, oid));
+            return Ok(WorktreeStatus::Modified(worktree_mode(&meta, index_entry, core_filemode), oid));
         }
         if meta.file_type().is_dir() {
             let dot_git = abs_path.join(".git");
@@ -1951,16 +1970,14 @@ fn read_worktree_info_fast(
     // (e.g., after git update-index --chmod=+x).
     let racy = index_entry_is_racy(index_entry, index_mtime);
     if meta.file_type().is_file() && stat_matches(index_entry, &meta) && !racy {
-        let wt_mode = if meta.permissions().mode() & 0o111 != 0 {
-            MODE_EXECUTABLE
-        } else {
-            MODE_REGULAR
-        };
+        let wt_mode = worktree_mode(&meta, index_entry, core_filemode);
         let idx_mode = canonicalize_mode(index_entry.mode);
         if wt_mode == idx_mode {
             return Ok(WorktreeStatus::Unchanged);
         }
-        // Mode differs — report as modified with same OID.
+        // Mode differs — report as modified with same OID. With
+        // core.filemode=false worktree_mode hands back the recorded mode, so
+        // this branch is unreachable there, which is the point.
         return Ok(WorktreeStatus::Modified(wt_mode, index_entry.oid));
     }
 
@@ -1980,14 +1997,9 @@ fn read_worktree_info_fast(
     }
 
     if meta.file_type().is_file() {
-        let mode = if meta.permissions().mode() & 0o111 != 0 {
-            MODE_EXECUTABLE
-        } else {
-            MODE_REGULAR
-        };
         let data = fs::read(abs_path)?;
         let oid = Odb::hash_object_data(ObjectKind::Blob, &data);
-        return Ok(WorktreeStatus::Modified(mode, oid));
+        return Ok(WorktreeStatus::Modified(worktree_mode(&meta, index_entry, core_filemode), oid));
     }
 
     // If it's a directory, check if it's a submodule (has .git subdirectory)
