@@ -914,6 +914,15 @@ impl SidebandPackReader {
     }
 
 
+    /// Bytes the reader is holding on behalf of a consumer, for tests.
+    ///
+    /// A reader that buffered instead of streaming would grow this to the
+    /// size of the packfile. That is the whole claim of this type, so it is
+    /// measured rather than argued.
+    #[cfg(test)]
+    pub fn retained_bytes(&self) -> usize {
+        self.ready.len() + self.held.len() + self.pushback.len()
+    }
     /// Pull side-band packets until at least one pack byte is decoded.
     fn fill(&mut self) -> std::io::Result<()> {
         loop {
@@ -2257,6 +2266,64 @@ mod streaming_reader_tests {
         assert_eq!(got, pack, "the pack must come back byte for byte");
     }
 
+    /// The point of the whole type: a large pack goes through without ever
+    /// being held whole.
+    ///
+    /// A 256 MiB pack is built, wrapped in side-band packets, and read back
+    /// 8 KiB at a time. The bytes must come back identical, and what the
+    /// reader retains must stay near the read size no matter how big the
+    /// pack gets -- that is the difference between streaming and buffering,
+    /// and it is asserted here because the failure mode is invisible in a
+    /// small test.
+    #[test]
+    fn a_large_pack_streams_without_being_held_whole() {
+        const PACK_BYTES: usize = 256 * 1024 * 1024;
+        let mut pack = b"PACK".to_vec();
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&0u32.to_be_bytes());
+        let filler = vec![b'a'; PACK_BYTES - pack.len() - 20];
+        pack.extend_from_slice(&filler);
+        pack.extend_from_slice(&[0u8; 20]);
+        let expected = pack.len();
+
+        // 64 KiB side-band packets, the size GitHub uses.
+        let mut body = pkt_line(b"NAK\n", None);
+        for piece in pack.chunks(60 * 1024) {
+            body.extend_from_slice(&pkt_line(piece, Some(1)));
+        }
+        drop(pack);
+
+        let dribble = Dribble { bytes: body, at: 0 };
+        let mut src = SidebandPackReader::new(
+            Box::new(BodyReader::new(Box::new(dribble))),
+            true,
+        );
+        src.mark();
+        let _ = src.read_control_payload().unwrap().unwrap();
+        src.rewind();
+        src.begin_pack();
+
+        let mut total = 0usize;
+        let mut buffer = [0u8; 8 * 1024];
+        let mut peak = 0usize;
+        loop {
+            let n = std::io::Read::read(&mut src, &mut buffer).unwrap();
+            if n == 0 {
+                break;
+            }
+            total += n;
+            peak = peak.max(src.retained_bytes());
+        }
+        assert_eq!(total, expected, "every byte of the pack must come back");
+        assert!(
+            peak < 1024 * 1024,
+            "the reader retained {peak} bytes at peak, which is not streaming",
+        );
+        assert!(
+            peak < expected / 64,
+            "retaining {peak} of {expected} bytes is buffering, not streaming",
+        );
+    }
     /// The same thing with the whole pack delivered in side-band chunks, which
     /// is how a real server splits a large packfile.
     #[test]
