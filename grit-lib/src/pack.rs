@@ -342,8 +342,119 @@ mod pack_cache {
     struct CachedPack {
         mtime: SystemTime,
         size: u64,
-        bytes: Arc<Vec<u8>>,
+        bytes: Arc<PackBytes>,
     }
+
+    /// Read-only view over a pack file's bytes.
+    ///
+    /// Pack files are mapped, not read into the heap: a repository can carry
+    /// gigabytes of packs, and 'fs::read' turns every touched pack into
+    /// *anonymous* memory the process owns until exit. On iOS that footprint
+    /// counts against the per-process jetsam limit, and a single 'status' on a
+    /// repository holding a ~1.2 GB pack (plus several ~100 MB ones) got the
+    /// embedding app killed at ~4 GiB ('vm-pageshortage'). A read-only
+    /// MAP_PRIVATE mapping is clean, file-backed memory the kernel may evict
+    /// under pressure, so walking a pack no longer inflates the process's
+    /// owned footprint.
+    pub enum PackBytes {
+        #[cfg(unix)]
+        Mapped(Mmap),
+        Owned(Vec<u8>),
+    }
+
+    impl PackBytes {
+        fn load(path: &Path) -> Result<PackBytes> {
+            #[cfg(unix)]
+            {
+                // Zero-length files cannot be mapped; they fall through to the
+                // read path (a pack is never legitimately empty, and the read
+                // path also produces the clearer error for a missing file).
+                if fs::metadata(path).map_err(Error::Io)?.len() > 0 {
+                    if let Ok(map) = Mmap::map(path) {
+                        return Ok(PackBytes::Mapped(map));
+                    }
+                }
+            }
+            Ok(PackBytes::Owned(fs::read(path).map_err(Error::Io)?))
+        }
+    }
+
+    impl std::ops::Deref for PackBytes {
+        type Target = [u8];
+
+        fn deref(&self) -> &[u8] {
+            match self {
+                #[cfg(unix)]
+                PackBytes::Mapped(m) => m.as_slice(),
+                PackBytes::Owned(v) => v,
+            }
+        }
+    }
+
+    /// A read-only MAP_PRIVATE file mapping.
+    ///
+    /// Packs are content-addressed and never modified in place -- gc/repack
+    /// writes a new file and unlinks the old one, which keeps an existing
+    /// mapping valid -- so the classic mmap-truncation SIGBUS hazard does not
+    /// arise here. (Object freshening touches only the mtime, not contents.)
+    #[cfg(unix)]
+    pub struct Mmap {
+        ptr: std::ptr::NonNull<libc::c_void>,
+        len: usize,
+    }
+
+    #[cfg(unix)]
+    impl Mmap {
+        fn map(path: &Path) -> io::Result<Mmap> {
+            use std::os::unix::io::AsRawFd;
+            let file = fs::File::open(path)?;
+            let len = file.metadata()?.len() as usize;
+            if len == 0 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "cannot mmap empty file"));
+            }
+            // SAFETY: fd is valid and open, len matches the file's size, and
+            // PROT_READ + MAP_PRIVATE yields a read-only private mapping.
+            let ptr = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    libc::PROT_READ,
+                    libc::MAP_PRIVATE,
+                    file.as_raw_fd(),
+                    0,
+                )
+            };
+            if ptr == libc::MAP_FAILED {
+                return Err(io::Error::last_os_error());
+            }
+            let Some(ptr) = std::ptr::NonNull::new(ptr) else {
+                return Err(io::Error::other("mmap returned a null address"));
+            };
+            Ok(Mmap { ptr, len })
+        }
+
+        fn as_slice(&self) -> &[u8] {
+            // SAFETY: the mapping covers len bytes for the lifetime of self
+            // and is read-only, so no mutable aliasing is possible.
+            unsafe { std::slice::from_raw_parts(self.ptr.as_ptr().cast::<u8>(), self.len) }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for Mmap {
+        fn drop(&mut self) {
+            // SAFETY: ptr/len came from one successful mmap and are unmapped
+            // exactly once, here.
+            unsafe { libc::munmap(self.ptr.as_ptr(), self.len) };
+        }
+    }
+
+    // The mapping is read-only and self-contained; sharing it across threads
+    // is sound.
+    #[cfg(unix)]
+    unsafe impl Send for Mmap {}
+    #[cfg(unix)]
+    unsafe impl Sync for Mmap {}
 
     /// Upper bound on retained delta-base bytes, matching git's default
     /// `core.deltaBaseCacheLimit` (96 MiB).
@@ -538,7 +649,7 @@ mod pack_cache {
 
     /// Get the raw bytes of a pack file from cache, re-reading from disk when the
     /// file's mtime/size changes.
-    pub fn get_pack_bytes(pack_path: &Path) -> Result<Arc<Vec<u8>>> {
+    pub fn get_pack_bytes(pack_path: &Path) -> Result<Arc<PackBytes>> {
         let sig = file_signature(pack_path);
         if let Some((mtime, size)) = sig {
             {
@@ -549,7 +660,7 @@ mod pack_cache {
                     }
                 }
             }
-            let bytes = Arc::new(fs::read(pack_path).map_err(Error::Io)?);
+            let bytes = Arc::new(PackBytes::load(pack_path)?);
             let mut g = lock();
             // The pack's content (re)entered the cache: any delta bases
             // inflated from a previous read of this path are now suspect.
@@ -656,6 +767,8 @@ mod pack_cache {
     }
 }
 
+pub use pack_cache::PackBytes;
+
 /// Read all pack indexes under `<objects_dir>/pack/` from the process-wide cache.
 ///
 /// Cached reads skip the `.idx` SHA-1 trailer verification that [`read_pack_index`]
@@ -686,7 +799,7 @@ pub fn read_pack_index_cached(idx_path: &Path) -> Result<Arc<PackIndex>> {
 /// # Errors
 ///
 /// Returns [`Error::Io`] when the pack cannot be read.
-pub fn read_pack_bytes_cached(pack_path: &Path) -> Result<Arc<Vec<u8>>> {
+pub fn read_pack_bytes_cached(pack_path: &Path) -> Result<Arc<PackBytes>> {
     pack_cache::get_pack_bytes(pack_path)
 }
 
@@ -2051,4 +2164,47 @@ pub fn read_idx_object_ids(idx_path: &Path) -> Result<Vec<ObjectId>> {
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A cached pack read must be a memory mapping, not a heap copy: mapping
+    /// is what keeps gigabyte-scale packs off the process's owned
+    /// (jetsam-counted) footprint on iOS. If this regresses to heap reads on
+    /// unix, a 'status' on a repository with a large pack can kill the host
+    /// app again.
+    #[cfg(unix)]
+    #[test]
+    fn cached_pack_bytes_are_memory_mapped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pack_path = dir.path().join("test.pack");
+        let payload = b"PACK\0\0\0\x02fake-pack-bytes";
+        fs::write(&pack_path, payload).expect("write pack");
+
+        let bytes = read_pack_bytes_cached(&pack_path).expect("map pack");
+        assert!(
+            matches!(&*bytes, PackBytes::Mapped(_)),
+            "pack bytes must be mmap'd on unix, not heap-read"
+        );
+        assert_eq!(&bytes[..], payload);
+
+        // A second read is served from the cache (same mapping, same Arc).
+        let again = read_pack_bytes_cached(&pack_path).expect("cached pack");
+        assert!(Arc::ptr_eq(&bytes, &again));
+    }
+
+    /// Zero-length files cannot be mapped; they fall back to the read path.
+    #[cfg(unix)]
+    #[test]
+    fn empty_pack_falls_back_to_owned_read() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pack_path = dir.path().join("empty.pack");
+        fs::write(&pack_path, b"").expect("write empty pack");
+
+        let bytes = read_pack_bytes_cached(&pack_path).expect("read empty pack");
+        assert!(matches!(&*bytes, PackBytes::Owned(_)));
+        assert!(bytes.is_empty());
+    }
 }
