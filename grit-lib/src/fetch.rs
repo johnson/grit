@@ -1286,14 +1286,15 @@ pub fn fetch_remote(
             pack.len()
         );
         if !pack.is_empty() {
+            // Store the pack as a pack rather than expanding it into loose
+            // objects: a phone charges one file write per object against its
+            // disk-write budget, and the loose path also has to keep every
+            // resolved object resident for delta bases. See crate::pack_store.
             let mut cursor = std::io::Cursor::new(pack);
-            crate::unpack_objects::unpack_objects(
+            crate::pack_store::store_pack_stream(
                 &mut cursor,
                 &local_odb,
-                &crate::unpack_objects::UnpackOptions {
-                    quiet: true,
-                    ..Default::default()
-                },
+                &crate::pack_store::StorePackOptions::default(),
             )?;
         }
     }

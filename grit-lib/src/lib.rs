@@ -177,6 +177,7 @@ pub mod objects;
 pub mod odb;
 pub mod pack;
 pub mod pack_geometry;
+pub mod pack_store;
 pub mod pack_name_hash;
 pub mod pack_rev;
 #[cfg(feature = "test-tools")]

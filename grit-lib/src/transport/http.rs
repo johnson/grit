@@ -861,6 +861,32 @@ impl SidebandPackReader {
         self.progress = None;
         result
     }
+
+    /// Validate the packfile signature, then store the arriving packfile as a
+    /// pack in the odb -- spooled to disk as it arrives and indexed at the end.
+    ///
+    /// Same shape as [Self::unpack_into], different sink. Expanding every object
+    /// into a loose file is what a phone cannot afford: see [crate::pack_store].
+    pub fn store_into(
+        &mut self,
+        odb: &crate::odb::Odb,
+        opts: &crate::pack_store::StorePackOptions,
+        progress: &mut dyn Progress,
+        not_a_pack: &str,
+    ) -> Result<crate::pack_store::StoredPack> {
+        self.expect_pack_magic(not_a_pack)?;
+        // SAFETY: the erased lifetime is sound because the sink is dropped
+        // again before this function returns, so it cannot outlive the
+        // reference it was taken from.
+        self.progress = Some(unsafe {
+            std::mem::transmute::<*mut dyn Progress, *mut (dyn Progress + 'static)>(
+                std::ptr::from_mut(progress),
+            )
+        });
+        let result = crate::pack_store::store_pack_stream(self, odb, opts);
+        self.progress = None;
+        result
+    }
     /// One pkt-line from the control section, with the same distinctions
     /// grit's parser makes. None means the response ended.
     pub fn read_control_packet(&mut self) -> std::io::Result<Option<pkt_line::Packet>> {
@@ -1576,12 +1602,9 @@ pub fn http_fetch(
         )?;
         shallow_update = su;
         if let Some(mut pack) = pack {
-            pack.unpack_into(
+            pack.store_into(
                 &local_odb,
-                &crate::unpack_objects::UnpackOptions {
-                    quiet: true,
-                    ..Default::default()
-                },
+                &crate::pack_store::StorePackOptions::default(),
                 progress,
                 "did not receive a valid pack from HTTP fetch",
             )?;
@@ -1788,12 +1811,9 @@ fn http_fetch_v2(
         )?;
         shallow_update = su;
         if let Some(mut pack) = pack {
-            pack.unpack_into(
+            pack.store_into(
                 &local_odb,
-                &crate::unpack_objects::UnpackOptions {
-                    quiet: true,
-                    ..Default::default()
-                },
+                &crate::pack_store::StorePackOptions::default(),
                 progress,
                 "did not receive a valid pack from v2 HTTP fetch",
             )?;
