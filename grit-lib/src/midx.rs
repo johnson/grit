@@ -128,6 +128,41 @@ fn read_be_u64(data: &[u8], off: usize) -> Result<u64> {
     Ok(u64::from_be_bytes(bytes))
 }
 
+/// Resolve a MIDX `OOFF` 32-bit offset field to a full 64-bit object offset,
+/// mirroring `nth_midxed_offset` in git/midx.c. The high bit marks a slot in
+/// the large-offset (LOFF) table **only when the MIDX carries one**; without a
+/// LOFF table every offset is a plain 32-bit value, which may legitimately sit
+/// in [2^31, 2^32) with its top bit set as data (e.g. objects in a 2.3 GiB
+/// pack). That is exactly what the writer emits when no offset exceeds 32 bits
+/// (`build_midx_bytes_filtered`), so a reader that treats the top bit
+/// unconditionally as a slot breaks its own round-trip.
+///
+/// `loff` is `(chunk_offset, chunk_len)` of the LOFF chunk, or `None` when
+/// the MIDX has no large-offset table. Returns `None` only when a LOFF table
+/// IS present and the recorded slot lies beyond it (Git `die()`s with
+/// "multi-pack-index large offset out of bounds" for that condition).
+fn resolve_midx_entry_offset(
+    data: &[u8],
+    raw_off: u32,
+    loff: Option<(usize, usize)>,
+) -> Option<u64> {
+    if raw_off & MIDX_LARGE_OFFSET_NEEDED == 0 {
+        return Some(u64::from(raw_off));
+    }
+    let Some((loff_off, loff_len)) = loff else {
+        // No large-offset table: the field is a raw 32-bit offset, top bit and all.
+        return Some(u64::from(raw_off));
+    };
+    let slot = (raw_off & !MIDX_LARGE_OFFSET_NEEDED) as usize;
+    if (slot + 1) * 8 > loff_len {
+        return None;
+    }
+    let b = loff_off + slot * 8;
+    let mut arr = [0u8; 8];
+    arr.copy_from_slice(&data[b..b + 8]);
+    Some(u64::from_be_bytes(arr))
+}
+
 struct MidxFileHeader {
     num_chunks: u8,
 }
@@ -1235,23 +1270,16 @@ pub fn verify_midx(objects_dir: &Path) -> std::result::Result<(), Vec<String>> {
             continue;
         }
 
-        // resolve MIDX-recorded offset (handle large offsets)
-        let m_offset: u64 = if off_raw & MIDX_LARGE_OFFSET_NEEDED != 0 {
-            let slot = (off_raw & !MIDX_LARGE_OFFSET_NEEDED) as usize;
-            match large_off {
-                Some((lo_off, lo_len)) if (slot + 1) * 8 <= lo_len => {
-                    let b = lo_off + slot * 8;
-                    let mut arr = [0u8; 8];
-                    arr.copy_from_slice(&data[b..b + 8]);
-                    u64::from_be_bytes(arr)
-                }
-                _ => {
-                    errors.push("multi-pack-index large offset out of bounds".to_owned());
-                    continue;
-                }
+        // Resolve the MIDX-recorded offset (git/midx.c `nth_midxed_offset`):
+        // the high bit is a large-offset slot only when a LOFF table is
+        // present; otherwise it is a plain 32-bit offset, possibly in
+        // [2^31, 2^32).
+        let m_offset: u64 = match resolve_midx_entry_offset(&data, off_raw, large_off) {
+            Some(o) => o,
+            None => {
+                errors.push("multi-pack-index large offset out of bounds".to_owned());
+                continue;
             }
-        } else {
-            u64::from(off_raw)
         };
 
         let Some(Some(idx)) = pack_indexes.get(pack_int_id as usize) else {
@@ -1431,7 +1459,12 @@ pub fn format_midx_show_objects_layer(
                 .map_err(|e| Error::CorruptObject(e.to_string()))?;
         let base = ooff_off + i * 8;
         let pack_id = read_be_u32(&data, base)? as usize;
-        let offset = u64::from(read_be_u32(&data, base + 4)?);
+        // Large-offset decode: the field is a LOFF slot only when the MIDX
+        // carries a large-offset table; otherwise it is a raw 32-bit offset.
+        let raw_off = read_be_u32(&data, base + 4)?;
+        let loff = find_chunk(&data, hdr_end, MIDX_CHUNKID_LARGEOFFSETS).ok();
+        let offset =
+            resolve_midx_entry_offset(&data, raw_off, loff).unwrap_or(u64::from(raw_off));
         let idx_name = names
             .get(pack_id)
             .ok_or_else(|| Error::CorruptObject("pack id out of range in MIDX".to_owned()))?;
@@ -1585,12 +1618,16 @@ pub fn load_midx_reuse_tables(objects_dir: &Path) -> Result<Option<MidxReuseTabl
         oids.push(ObjectId::from_bytes(&data[base..base + hash_len])?);
     }
 
+    let loff = find_chunk(&data, hdr_end, MIDX_CHUNKID_LARGEOFFSETS).ok();
     let mut pack_and_offset = Vec::with_capacity(num_objects);
     for i in 0..num_objects {
         let ob = ooff_off + i * 8;
         let pack_id = read_be_u32(&data, ob)?;
         let off32 = read_be_u32(&data, ob + 4)?;
-        pack_and_offset.push((pack_id, u64::from(off32)));
+        let offset = resolve_midx_entry_offset(&data, off32, loff).ok_or_else(|| {
+            Error::CorruptObject("multi-pack-index large offset out of bounds".to_owned())
+        })?;
+        pack_and_offset.push((pack_id, offset));
     }
 
     let mut rid_order = Vec::with_capacity(num_objects);
@@ -1774,7 +1811,13 @@ pub fn midx_lookup_pack_and_offset(objects_dir: &Path, oid: &ObjectId) -> Result
     let ob = ooff_off + lo * 8;
     let pack_id = read_be_u32(&data, ob)?;
     let off32 = read_be_u32(&data, ob + 4)?;
-    Ok((pack_id, u64::from(off32)))
+    // Large-offset decode (git/midx.c `nth_midxed_offset`): the high bit is a
+    // LOFF slot only when the MIDX carries a large-offset table.
+    let loff = find_chunk(&data, hdr_end, MIDX_CHUNKID_LARGEOFFSETS).ok();
+    let offset = resolve_midx_entry_offset(&data, off32, loff).ok_or_else(|| {
+        Error::CorruptObject("multi-pack-index large offset out of bounds".to_owned())
+    })?;
+    Ok((pack_id, offset))
 }
 
 /// Returns whether `oid` appears in the active MIDX OID table for `objects_dir`.
@@ -2138,20 +2181,19 @@ pub fn try_read_object_via_midx(
     let obase = ooff_off + pos * 8;
     let pack_id = read_be_u32(&data, obase)?;
     let raw_off = read_be_u32(&data, obase + 4)?;
-    let _offset = if (raw_off & MIDX_LARGE_OFFSET_NEEDED) != 0 {
-        let idx = (raw_off & !MIDX_LARGE_OFFSET_NEEDED) as usize;
-        let need = (idx + 1) * 8;
-        match loff {
-            Some((loff_off, loff_len)) if loff_len >= need => {
-                read_be_u64(&data, loff_off + idx * 8)?
-            }
-            _ => {
-                // git/midx.c `nth_midxed_offset`: die on out-of-bounds large offset.
-                midx_die(&["multi-pack-index large offset out of bounds"]);
-            }
+    // git/midx.c `nth_midxed_offset`: the high bit is a large-offset slot
+    // only when the MIDX carries a LOFF table; otherwise it is a plain
+    // 32-bit offset, possibly in [2^31, 2^32).
+    let _offset = match resolve_midx_entry_offset(&data, raw_off, loff) {
+        Some(off) => off,
+        None => {
+            // Git dies here; a stale/corrupt MIDX must not take down an
+            // embedding host process (the app links this library and would
+            // exit with the die). Warn once and fall through to the per-pack
+            // sources below — the object may still be found in a pack or loose.
+            midx_warn_once("error: multi-pack-index large offset out of bounds");
+            return Ok(None);
         }
-    } else {
-        u64::from(raw_off)
     };
 
     let idx_name = pack_names
@@ -2839,4 +2881,209 @@ fn scrub_root_midx_sidecars_except(pack_dir: &Path, keep_hex: Option<&str>) -> R
         let _ = fs::remove_file(ent.path());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pack::PackIndexEntry;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    const PACK_A: &str = "pack-000000000000000000000000000000000000000a.idx";
+    const PACK_B: &str = "pack-111111111111111111111111111111111111111b.idx";
+
+    /// Build a MIDX v1 (SHA-1) image covering the given
+    /// `(pack_basename, object offsets, oid first byte)` triples. Pack names
+    /// must be strictly ascending. OIDs are made unique by setting byte 1 to
+    /// the object index within the pack.
+    fn build_v1_midx_for_test(packs: &[(&str, Vec<u64>, u8)]) -> Vec<u8> {
+        let names: Vec<String> = packs.iter().map(|(n, _, _)| (*n).to_owned()).collect();
+        let mut indexes = Vec::with_capacity(packs.len());
+        for (name, offsets, first) in packs {
+            let entries = offsets
+                .iter()
+                .enumerate()
+                .map(|(k, off)| {
+                    let mut oid = vec![*first; 20];
+                    oid[1] = k as u8;
+                    PackIndexEntry { oid, offset: *off }
+                })
+                .collect();
+            let stem = name.strip_suffix(".idx").unwrap_or(name);
+            indexes.push(PackIndex {
+                idx_path: stem.into(),
+                pack_path: stem.into(),
+                hash_bytes: 20,
+                entries,
+                fanout: [0u32; 256],
+            });
+        }
+        let (bytes, _) =
+            build_midx_bytes_filtered(&names, &indexes, None, false, false, 1, 1, None)
+                .expect("midx build");
+        bytes
+    }
+
+    fn ooff_raw_offsets(bytes: &[u8]) -> Vec<u32> {
+        let (_, hdr_end, _) = parse_midx_header(bytes).unwrap();
+        let (ooff_off, ooff_len) =
+            find_chunk(bytes, hdr_end, MIDX_CHUNKID_OBJECTOFFSETS).unwrap();
+        (0..ooff_len / 8)
+            .map(|i| read_be_u32(bytes, ooff_off + i * 8 + 4).unwrap())
+            .collect()
+    }
+
+    /// The shape of the crashing note-gen-sync MIDX: no LOFF chunk (no offset
+    /// exceeds 32 bits) but a 2.3 GiB pack, so one offset sits in [2^31, 2^32)
+    /// with its top bit set as data.
+    fn crash_shape_midx() -> Vec<u8> {
+        build_v1_midx_for_test(&[
+            (PACK_A, vec![0x0000_6e2au64], 0x01),
+            (PACK_B, vec![0x0000_6e2au64, 0x8a34_5594u64], 0x02),
+        ])
+    }
+
+    static SCRATCH: AtomicU32 = AtomicU32::new(0);
+
+    /// Materialize the MIDX image in a scratch objects dir (with empty `.idx`
+    /// sidecars for the named packs) and return the objects dir plus the OID of
+    /// the object at `pack_b_index` in pack B — the top-bit-offset entry when
+    /// `pack_b_index = 1`.
+    fn scratch_objects_dir(bytes: &[u8], pack_b_index: usize) -> (std::path::PathBuf, ObjectId) {
+        let n = SCRATCH.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join(format!("grit-midx-test-{}-{n}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let objects_dir = dir.join(".git").join("objects");
+        let pack_dir = objects_dir.join("pack");
+        fs::create_dir_all(&pack_dir).unwrap();
+        fs::write(pack_dir.join("multi-pack-index"), bytes).unwrap();
+        fs::write(pack_dir.join(PACK_A), b"").unwrap();
+        fs::write(pack_dir.join(PACK_B), b"").unwrap();
+        let mut oid_bytes = vec![0x02u8; 20];
+        oid_bytes[1] = pack_b_index as u8;
+        (objects_dir, ObjectId::from_bytes(&oid_bytes).unwrap())
+    }
+
+    /// The pure decode rule (git/midx.c `nth_midxed_offset`): top bit is a LOFF
+    /// slot only when a LOFF table is present.
+    #[test]
+    fn resolve_helper_distinguishes_raw_top_bit_from_slot() {
+        let table = [0u64, 0x8a34_5594, 0x8b0e_5daa]
+            .iter()
+            .flat_map(|v| v.to_be_bytes())
+            .collect::<Vec<_>>();
+        let raw: u32 = 0x8a34_5594;
+        // No table: the field is verbatim, top bit and all.
+        assert_eq!(resolve_midx_entry_offset(&table, raw, None), Some(u64::from(raw)));
+        // Table at chunk offset 0: slot 1 resolves through the table.
+        assert_eq!(
+            resolve_midx_entry_offset(&table, MIDX_LARGE_OFFSET_NEEDED | 1, Some((0, table.len()))),
+            Some(0x8a34_5594)
+        );
+        // Nonzero chunk offset.
+        let mut padded = vec![0u8; 3];
+        padded.extend_from_slice(&table);
+        assert_eq!(
+            resolve_midx_entry_offset(&padded, MIDX_LARGE_OFFSET_NEEDED, Some((3, table.len()))),
+            Some(0)
+        );
+        // Slot beyond the table is the Git die condition.
+        assert_eq!(
+            resolve_midx_entry_offset(&table, MIDX_LARGE_OFFSET_NEEDED | 3, Some((0, table.len()))),
+            None
+        );
+        // Clear top bit with a table present: still raw.
+        assert_eq!(
+            resolve_midx_entry_offset(&table, 0x6e2a, Some((0, table.len()))),
+            Some(0x6e2a)
+        );
+    }
+
+    /// Regression (2026-10-19, app launch crash
+    /// `fatal: multi-pack-index large offset out of bounds`): a MIDX covering a
+    /// 2.3 GiB pack has no LOFF chunk and stores offsets in [2^31, 2^32)
+    /// verbatim. The reader used to treat the top bit as a LOFF slot
+    /// unconditionally and `die` on the first such lookup, taking the embedding
+    /// app down on launch.
+    #[test]
+    fn top_bit_offset_without_loff_table_decodes_verbatim() {
+        let bytes = crash_shape_midx();
+
+        let (_, hdr_end, _) = parse_midx_header(&bytes).unwrap();
+        assert!(
+            find_chunk(&bytes, hdr_end, MIDX_CHUNKID_LARGEOFFSETS).is_err(),
+            "no offset exceeds 2^32, so no LOFF chunk is emitted"
+        );
+
+        // Every entry decodes to itself (raw 32-bit), top bit included.
+        let raws = ooff_raw_offsets(&bytes);
+        assert_eq!(raws.len(), 3);
+        assert_eq!(raws[2], 0x8a34_5594);
+        for raw in &raws {
+            assert_eq!(
+                resolve_midx_entry_offset(&bytes, *raw, None),
+                Some(u64::from(*raw))
+            );
+        }
+
+        // The structurally valid file must load (before the fix the next lookup
+        // ended in `midx_die`).
+        assert!(matches!(
+            midx_load_for_read(&bytes, 1),
+            MidxLoadResult::Ok(_)
+        ));
+
+        // End-to-end lookup must return the raw 64-bit offset.
+        let (objects_dir, oid) = scratch_objects_dir(&bytes, 1);
+        let (pack_id, off) = midx_lookup_pack_and_offset(&objects_dir, &oid).unwrap();
+        assert_eq!(pack_id, 1);
+        assert_eq!(off, 0x8a34_5594);
+        let _ = fs::remove_dir_all(objects_dir.parent().unwrap().parent().unwrap());
+    }
+
+    /// The crashing app path, one step further: top-bit offsets plus
+    /// unparseable `.idx` sidecars. The reader must resolve the offset, fail
+    /// the pack-index load, warn once, and return `Ok(None)` so callers fall
+    /// back to per-pack / loose sources — never exit the host process.
+    #[test]
+    fn top_bit_offset_with_unreadable_pack_idx_returns_none() {
+        let bytes = crash_shape_midx();
+        let (objects_dir, oid) = scratch_objects_dir(&bytes, 1);
+        let res = try_read_object_via_midx(&objects_dir, &oid);
+        let obj = res.expect("the reader must return, not die");
+        assert!(obj.is_none(), "unreadable idx: callers must fall back");
+        let _ = fs::remove_dir_all(objects_dir.parent().unwrap().parent().unwrap());
+    }
+
+    /// Offsets beyond 2^32 force the LOFF table; entries >= 2^31 become
+    /// L-bit + slot and must decode back through the table while smaller
+    /// entries stay raw.
+    #[test]
+    fn offsets_beyond_32_bits_round_trip_through_loff_table() {
+        let bytes = build_v1_midx_for_test(&[
+            (PACK_A, vec![0x0000_6e2au64], 0x01),
+            (PACK_B, vec![0x0000_6e2au64, 0x1_4000_0001u64], 0x02),
+        ]);
+        let (_, hdr_end, _) = parse_midx_header(&bytes).unwrap();
+        let loff = find_chunk(&bytes, hdr_end, MIDX_CHUNKID_LARGEOFFSETS)
+            .expect("a 5 GiB offset requires a LOFF chunk");
+        assert_eq!(loff.1, 8, "one 64-bit large offset");
+        let raws = ooff_raw_offsets(&bytes);
+        assert_eq!(raws.len(), 3);
+        assert_eq!(
+            resolve_midx_entry_offset(&bytes, raws[0], Some(loff)),
+            Some(0x6e2a)
+        );
+        assert_eq!(
+            resolve_midx_entry_offset(&bytes, raws[2], Some(loff)),
+            Some(0x1_4000_0001)
+        );
+        assert!(raws[2] & MIDX_LARGE_OFFSET_NEEDED != 0);
+        // End-to-end: the lookup path resolves the slot value.
+        let (objects_dir, oid) = scratch_objects_dir(&bytes, 1);
+        let (_, off) = midx_lookup_pack_and_offset(&objects_dir, &oid).unwrap();
+        assert_eq!(off, 0x1_4000_0001);
+        let _ = fs::remove_dir_all(objects_dir.parent().unwrap().parent().unwrap());
+    }
 }
